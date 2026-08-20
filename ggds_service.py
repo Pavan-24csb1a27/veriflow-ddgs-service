@@ -66,13 +66,17 @@ async def search(payload: SearchRequest, x_service_secret: Optional[str] = Heade
         return SearchResponse(results=[], note="Empty query.")
 
     try:
-        # backend="duckduckgo" pins to a single fast backend instead of
-        # ddgs's default multi-engine fallback chain (which can try
-        # several search engines sequentially before giving up on an
-        # obscure query — that's what was causing 15s+ timeouts under
-        # Render's free-tier CPU constraints). If DuckDuckGo itself starts
-        # failing broadly, remove this to restore automatic fallback.
-        raw_results = DDGS().text(payload.query, max_results=payload.max_results, backend="duckduckgo")
+        # Reverted the earlier backend="duckduckgo" pin — DuckDuckGo
+        # started rejecting/blocking ALL queries from Render's IPs
+        # (confirmed: even "coffee" returned zero results), which is a
+        # known risk with datacenter IPs getting anti-bot-blocked by a
+        # single search engine. Letting ddgs use its default multi-backend
+        # fallback chain (Bing, Brave, Yahoo, etc.) is more resilient —
+        # slower on average, but doesn't go to zero if one engine blocks
+        # this IP range. If this specific failure mode returns, the real
+        # fix is a paid search API (Tavily/SerpAPI), not re-pinning to a
+        # single free backend.
+        raw_results = DDGS().text(payload.query, max_results=payload.max_results)
     except Exception as e:
         # Don't raise a 500 for a search-engine hiccup — return an empty
         # result set with an explanation, same graceful-degrade pattern
