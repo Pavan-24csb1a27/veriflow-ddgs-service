@@ -1,8 +1,18 @@
 """
 ddgs_service.py
 -----------------
-A small, standalone FastAPI service wrapping `ddgs` with rate-limit resilience,
-exponential backoff, backend rotation, and request caching.
+A small, standalone FastAPI service wrapping `ddgs` with rate-limit
+resilience, exponential backoff, backend rotation, and request caching.
+
+FIXED: the previous version called ddgs.text(keywords=query, ...), but
+the current ddgs library (>=9.x) renamed that parameter to `query`. The
+old `keywords` name is a leftover from the predecessor package
+(duckduckgo_search), which ddgs replaced. Calling text(keywords=...)
+raises "DDGS.text() missing 1 required positional argument: 'query'"
+on every single call, on every backend, every time - which is exactly
+why every search request was failing identically regardless of the
+retry/backend-rotation logic wrapped around it. That logic was sound;
+the one line calling the library was wrong.
 
 Run locally:
     uvicorn ddgs_service:app --host 0.0.0.0 --port 8001
@@ -15,7 +25,7 @@ Environment variables:
 import os
 import time
 import asyncio
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI, HTTPException, Header, status
 from pydantic import BaseModel
@@ -31,8 +41,8 @@ MAX_RETRIES = 3
 INITIAL_BACKOFF_SECONDS = 1.5
 CACHE_TTL_SECONDS = 300  # 5-minute cache for duplicate queries
 
-# Simple in-memory response cache: { query_lower: (timestamp, results_list) }
-_query_cache: Dict[str, tuple[float, List[Dict[str, Any]]]] = {}
+# Simple in-memory response cache: { cache_key: (timestamp, results_list) }
+_query_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
 
 class SearchRequest(BaseModel):
@@ -51,8 +61,8 @@ class SearchResponse(BaseModel):
     note: str = ""
 
 
-def clean_cache():
-    """Remove expired items from in-memory cache."""
+def clean_cache() -> None:
+    """Remove expired items from the in-memory cache."""
     now = time.time()
     expired_keys = [k for k, (ts, _) in _query_cache.items() if now - ts > CACHE_TTL_SECONDS]
     for k in expired_keys:
@@ -61,7 +71,9 @@ def clean_cache():
 
 def perform_ddgs_search(query: str, max_results: int) -> List[Dict[str, Any]]:
     """
-    Executes search with backend fallback rotation across 'auto', 'lite', and 'html'.
+    Executes a search with backend fallback rotation across
+    'auto', 'lite', and 'html'. Tries each in order and returns the
+    first backend that yields any results.
     """
     backends = ["auto", "lite", "html"]
     last_error = None
@@ -73,11 +85,13 @@ def perform_ddgs_search(query: str, max_results: int) -> List[Dict[str, Any]]:
                 ddgs_kwargs["proxy"] = DDGS_PROXY
 
             with DDGS(**ddgs_kwargs) as ddgs:
+                # NOTE: the parameter is `query`, not `keywords`. This was
+                # the entire bug - see the module docstring above.
                 results = list(
                     ddgs.text(
-                        keywords=query,
+                        query=query,
                         backend=backend,
-                        max_results=max_results
+                        max_results=max_results,
                     )
                 )
                 if results:
@@ -107,18 +121,18 @@ async def search(payload: SearchRequest, x_service_secret: Optional[str] = Heade
         return SearchResponse(results=[], note="Empty query.")
 
     cache_key = f"{clean_query.lower()}:{payload.max_results}"
-    
+
     # 1. Check in-memory cache
     clean_cache()
     if cache_key in _query_cache:
         _, cached_results = _query_cache[cache_key]
         return SearchResponse(
             results=[SearchResultItem(**r) for r in cached_results],
-            note="Cached result."
+            note="Cached result.",
         )
 
-    # 2. Retry loop with Exponential Backoff
-    raw_results = []
+    # 2. Retry loop with exponential backoff
+    raw_results: List[Dict[str, Any]] = []
     last_exception = None
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -129,7 +143,6 @@ async def search(payload: SearchRequest, x_service_secret: Optional[str] = Heade
         except Exception as e:
             last_exception = e
             if attempt < MAX_RETRIES:
-                # Calculate sleep duration: 1.5s, 3.0s, etc.
                 sleep_time = INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))
                 await asyncio.sleep(sleep_time)
 
